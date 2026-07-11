@@ -18,6 +18,7 @@
 #include <string.h>
 #include <time.h>
 #include "lmdb.h"
+#include "mtest_common.h"
 
 #define E(expr) CHECK((rc = (expr)) == MDB_SUCCESS, #expr)
 #define RES(err, expr) ((rc = expr) == (err) || (CHECK(!rc, #expr), 0))
@@ -37,15 +38,18 @@ int main(int argc,char * argv[])
 	MDB_cursor *cursor;
 	int count;
 	int *values;
+	int test_memory;
 	long kval;
 	char *sval;
 
 	srand(time(NULL));
 
+	for (test_memory=0; test_memory<2; test_memory++) {
+	mtest_banner(argv[0], test_memory);
 	E(mdb_env_create(&env));
 	E(mdb_env_set_mapsize(env, 10485760));
 	E(mdb_env_set_maxdbs(env, 4));
-	E(mdb_env_open(env, "./testdb", MDB_FIXEDMAP|MDB_NOSYNC, 0664));
+	E(mtest_env_open(env, test_memory, MDB_FIXEDMAP|MDB_NOSYNC));
 
 	E(mdb_txn_begin(env, NULL, 0, &txn));
 	E(mdb_dbi_open(txn, "id6", MDB_CREATE|MDB_INTEGERKEY, &dbi));
@@ -136,6 +140,8 @@ int main(int argc,char * argv[])
 	mdb_dbi_close(env, dbi);
 #endif
 	mdb_env_close(env);
+	free(sval);
+	}
 
 	return 0;
 }

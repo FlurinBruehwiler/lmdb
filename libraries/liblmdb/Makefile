@@ -42,6 +42,7 @@ ILIBS	= liblmdb.a liblmdb$(SOEXT)
 IPROGS	= mdb_stat mdb_copy mdb_dump mdb_load
 IDOCS	= mdb_stat.1 mdb_copy.1 mdb_dump.1 mdb_load.1
 PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5
+TESTS	= mtest mtest2 mtest3 mtest4 mtest5
 all:	$(ILIBS) $(PROGS)
 
 install: $(ILIBS) $(IPROGS) $(IHDRS)
@@ -58,8 +59,8 @@ clean:
 	rm -rf $(PROGS) *.[ao] *.[ls]o *~ testdb
 
 test:	all
-	rm -rf testdb && mkdir testdb
-	./mtest && ./mdb_stat testdb
+	for t in $(TESTS); do rm -rf testdb && mkdir testdb && ./$$t || exit $$?; done
+	./mdb_stat testdb
 
 liblmdb.a:	mdb.o midl.o
 	$(AR) rs $@ mdb.o midl.o
@@ -95,7 +96,7 @@ midl.lo: midl.c midl.h
 %:	%.o
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-%.o:	%.c lmdb.h
+%.o:	%.c lmdb.h mtest_common.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $<
 
 COV_FLAGS=-fprofile-arcs -ftest-coverage

@@ -467,6 +467,10 @@ static int mdb_mutex_failed(MDB_env *env, mdb_mutexref_t mutex, int rc);
 #define	MS_ASYNC	0
 #endif
 
+#if !defined(_WIN32) && !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
 	/** A page number in the database.
 	 *	Note that 64 bit page numbers are overkill, since pages themselves
 	 *	already represent 12-13 bits of addressable memory, and the OS will
@@ -2579,6 +2583,8 @@ mdb_env_sync(MDB_env *env, int force)
 	int rc = 0;
 	if (env->me_flags & MDB_RDONLY)
 		return EACCES;
+	if (env->me_flags & MDB_MEMORY)
+		return MDB_SUCCESS;
 	if (force || !F_ISSET(env->me_flags, MDB_NOSYNC)) {
 		if (env->me_flags & MDB_WRITEMAP) {
 			int flags = ((env->me_flags & MDB_MAPASYNC) && !force)
@@ -3867,6 +3873,19 @@ mdb_env_init_meta(MDB_env *env, MDB_meta *meta)
 	DPUTS("writing new meta page");
 
 	psize = env->me_psize;
+	if (env->me_flags & MDB_MEMORY) {
+		p = (MDB_page *)env->me_map;
+		memset(p, 0, psize * NUM_METAS);
+		p->mp_pgno = 0;
+		p->mp_flags = P_META;
+		*(MDB_meta *)METADATA(p) = *meta;
+
+		q = (MDB_page *)((char *)p + psize);
+		q->mp_pgno = 1;
+		q->mp_flags = P_META;
+		*(MDB_meta *)METADATA(q) = *meta;
+		return MDB_SUCCESS;
+	}
 
 	p = calloc(NUM_METAS, psize);
 	if (!p)
@@ -3936,7 +3955,7 @@ mdb_env_write_meta(MDB_txn *txn)
 		__sync_synchronize();
 #endif
 		mp->mm_txnid = txn->mt_txnid;
-		if (!(flags & (MDB_NOMETASYNC|MDB_NOSYNC))) {
+		if (!(flags & (MDB_MEMORY|MDB_NOMETASYNC|MDB_NOSYNC))) {
 			unsigned meta_size = env->me_psize;
 			rc = (env->me_flags & MDB_MAPASYNC) ? MS_ASYNC : MS_SYNC;
 			ptr = (char *)mp - PAGEHDRSZ;
@@ -4033,6 +4052,18 @@ mdb_env_pick_meta(const MDB_env *env)
 	return metas[ metas[0]->mm_txnid < metas[1]->mm_txnid ];
 }
 
+static int ESECT
+mdb_env_unmap(MDB_env *env)
+{
+	if (!(env->me_flags & MDB_MEMORY))
+		return munmap(env->me_map, env->me_mapsize);
+#ifdef _WIN32
+	return VirtualFree(env->me_map, 0, MEM_RELEASE) ? 0 : -1;
+#else
+	return munmap(env->me_map, env->me_mapsize);
+#endif
+}
+
 int ESECT
 mdb_env_create(MDB_env **env)
 {
@@ -4064,6 +4095,24 @@ mdb_env_map(MDB_env *env, void *addr)
 {
 	MDB_page *p;
 	unsigned int flags = env->me_flags;
+	if (flags & MDB_MEMORY) {
+		if (addr)
+			return EINVAL;
+#ifdef _WIN32
+		env->me_map = VirtualAlloc(NULL, env->me_mapsize,
+			MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+		if (!env->me_map)
+			return ErrCode();
+#else
+		env->me_map = mmap(NULL, env->me_mapsize, PROT_READ|PROT_WRITE,
+			MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+		if (env->me_map == MAP_FAILED) {
+			env->me_map = NULL;
+			return ErrCode();
+		}
+#endif
+		goto mapped;
+	}
 #ifdef _WIN32
 	int rc;
 	HANDLE mh;
@@ -4141,6 +4190,7 @@ mdb_env_map(MDB_env *env, void *addr)
 	if (addr && env->me_map != addr)
 		return EBUSY;	/* TODO: Make a new MDB_* error code? */
 
+mapped:
 	p = (MDB_page *)env->me_map;
 	env->me_metas[0] = METADATA(p);
 	env->me_metas[1] = (MDB_meta *)((char *)env->me_metas[0] + env->me_psize);
@@ -4169,7 +4219,7 @@ mdb_env_set_mapsize(MDB_env *env, size_t size)
 			if (size < minsize)
 				size = minsize;
 		}
-		munmap(env->me_map, env->me_mapsize);
+		mdb_env_unmap(env);
 		env->me_mapsize = size;
 		old = (env->me_flags & MDB_FIXEDMAP) ? env->me_map : NULL;
 		rc = mdb_env_map(env, old);
@@ -4487,7 +4537,15 @@ mdb_env_open2(MDB_env *env)
 	}
 #endif
 
-	if ((i = mdb_env_read_header(env, &meta)) != 0) {
+	if (flags & MDB_MEMORY) {
+		newenv = 1;
+		env->me_psize = env->me_os_psize;
+		if (env->me_psize > MAX_PAGESIZE)
+			env->me_psize = MAX_PAGESIZE;
+		memset(&meta, 0, sizeof(meta));
+		mdb_env_init_meta0(env, &meta);
+		meta.mm_mapsize = DEFAULT_MAPSIZE;
+	} else if ((i = mdb_env_read_header(env, &meta)) != 0) {
 		if (i != ENOENT)
 			return i;
 		DPUTS("new mdbenv");
@@ -4516,7 +4574,7 @@ mdb_env_open2(MDB_env *env)
 	}
 	meta.mm_mapsize = env->me_mapsize;
 
-	if (newenv && !(flags & MDB_FIXEDMAP)) {
+	if (newenv && !(flags & (MDB_FIXEDMAP|MDB_MEMORY))) {
 		/* mdb_env_map() may grow the datafile.  Write the metapages
 		 * first, so the file will be valid if initialization fails.
 		 * Except with FIXEDMAP, since we do not yet know mm_address.
@@ -5044,7 +5102,7 @@ fail:
 	 */
 #define	CHANGEABLE	(MDB_NOSYNC|MDB_NOMETASYNC|MDB_MAPASYNC|MDB_NOMEMINIT)
 #define	CHANGELESS	(MDB_FIXEDMAP|MDB_NOSUBDIR|MDB_RDONLY| \
-	MDB_WRITEMAP|MDB_NOTLS|MDB_NOLOCK|MDB_NORDAHEAD)
+	MDB_WRITEMAP|MDB_NOTLS|MDB_NOLOCK|MDB_NORDAHEAD|MDB_MEMORY)
 
 #if VALID_FLAGS & PERSISTENT_FLAGS & (CHANGEABLE|CHANGELESS)
 # error "Persistent DB flags & env flags overlap, but both go in mm_flags"
@@ -5055,15 +5113,27 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 {
 	int rc, excl = -1;
 	MDB_name fname;
+	int memory;
 
-	if (env->me_fd!=INVALID_HANDLE_VALUE || (flags & ~(CHANGEABLE|CHANGELESS)))
+	if ((env->me_flags & MDB_ENV_ACTIVE) || env->me_fd!=INVALID_HANDLE_VALUE ||
+		(flags & ~(CHANGEABLE|CHANGELESS)))
 		return EINVAL;
 
 	flags |= env->me_flags;
+	if (flags & MDB_MEMORY) {
+		if ((flags & (MDB_RDONLY|MDB_FIXEDMAP)) || path)
+			return EINVAL;
+		flags |= MDB_WRITEMAP|MDB_NOLOCK;
+	}
+	memory = flags & MDB_MEMORY;
 
-	rc = mdb_fname_init(path, flags, &fname);
-	if (rc)
-		return rc;
+	if (!memory) {
+		rc = mdb_fname_init(path, flags, &fname);
+		if (rc)
+			return rc;
+	} else {
+		memset(&fname, 0, sizeof(fname));
+	}
 
 	if (flags & MDB_RDONLY) {
 		/* silently ignore WRITEMAP when we're only getting read access */
@@ -5077,7 +5147,7 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	if (rc)
 		goto leave;
 
-	env->me_path = strdup(path);
+	env->me_path = strdup(path ? path : "");
 	env->me_dbxs = calloc(env->me_maxdbs, sizeof(MDB_dbx));
 	env->me_dbflags = calloc(env->me_maxdbs, sizeof(uint16_t));
 	env->me_dbiseqs = calloc(env->me_maxdbs, sizeof(unsigned int));
@@ -5088,19 +5158,21 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	env->me_dbxs[FREE_DBI].md_cmp = mdb_cmp_long; /* aligned MDB_INTEGERKEY */
 
 	/* For RDONLY, get lockfile after we know datafile exists */
-	if (!(flags & (MDB_RDONLY|MDB_NOLOCK))) {
+	if (!memory && !(flags & (MDB_RDONLY|MDB_NOLOCK))) {
 		rc = mdb_env_setup_locks(env, &fname, mode, &excl);
 		if (rc)
 			goto leave;
 	}
 
-	rc = mdb_fopen(env, &fname,
-		(flags & MDB_RDONLY) ? MDB_O_RDONLY : MDB_O_RDWR,
-		mode, &env->me_fd);
-	if (rc)
-		goto leave;
+	if (!memory) {
+		rc = mdb_fopen(env, &fname,
+			(flags & MDB_RDONLY) ? MDB_O_RDONLY : MDB_O_RDWR,
+			mode, &env->me_fd);
+		if (rc)
+			goto leave;
+	}
 
-	if ((flags & (MDB_RDONLY|MDB_NOLOCK)) == MDB_RDONLY) {
+	if (!memory && (flags & (MDB_RDONLY|MDB_NOLOCK)) == MDB_RDONLY) {
 		rc = mdb_env_setup_locks(env, &fname, mode, &excl);
 		if (rc)
 			goto leave;
@@ -5147,7 +5219,8 @@ leave:
 	if (rc) {
 		mdb_env_close0(env, excl);
 	}
-	mdb_fname_destroy(fname);
+	if (!memory)
+		mdb_fname_destroy(fname);
 	return rc;
 }
 
@@ -5189,7 +5262,7 @@ mdb_env_close0(MDB_env *env, int excl)
 	}
 
 	if (env->me_map) {
-		munmap(env->me_map, env->me_mapsize);
+		mdb_env_unmap(env);
 	}
 	if (env->me_mfd != INVALID_HANDLE_VALUE)
 		(void) close(env->me_mfd);

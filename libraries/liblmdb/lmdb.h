@@ -303,6 +303,8 @@ typedef void (MDB_rel_func)(MDB_val *item, void *oldptr, void *newptr, void *rel
 #define MDB_NORDAHEAD	0x800000
 	/** don't initialize malloc'd memory before writing to datafile */
 #define MDB_NOMEMINIT	0x1000000
+	/** keep the environment entirely in process-local memory */
+#define MDB_MEMORY		0x2000000
 /** @} */
 
 /**	@defgroup	mdb_dbi_open	Database Flags
@@ -614,6 +616,13 @@ int  mdb_env_create(MDB_env **env);
 	 *		caller is expected to overwrite all of the memory that was
 	 *		reserved in that case.
 	 *		This flag may be changed at any time using #mdb_env_set_flags().
+	 *	<li>#MDB_MEMORY
+	 *		Keep the environment entirely in process-local memory instead of
+	 *		using data and lock files. The \b path argument may be NULL. The
+	 *		environment is empty when opened and is discarded by #mdb_env_close().
+	 *		This mode implies #MDB_WRITEMAP and #MDB_NOLOCK. It is not durable,
+	 *		cannot be shared with other processes, and currently cannot be used
+	 *		with #MDB_RDONLY or #MDB_FIXEDMAP.
 	 * </ul>
 	 * @param[in] mode The UNIX permissions to set on created files and semaphores.
 	 * This parameter is ignored on Windows.
