@@ -5111,7 +5111,7 @@ fail:
 int ESECT
 mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode)
 {
-	int rc, excl = -1;
+	int rc = MDB_SUCCESS, excl = -1;
 	MDB_name fname;
 	int memory;
 
