@@ -4052,16 +4052,46 @@ mdb_env_pick_meta(const MDB_env *env)
 	return metas[ metas[0]->mm_txnid < metas[1]->mm_txnid ];
 }
 
+/** Allocate the anonymous region backing an #MDB_MEMORY environment. */
+static void * ESECT
+mdb_memory_alloc(size_t size)
+{
+#ifdef _WIN32
+	return VirtualAlloc(NULL, size, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+#elif defined(__EMSCRIPTEN__)
+	/* Emscripten's anonymous mmap zero-fills the whole region, which puts
+	 * every page of the map in memory up front. Freshly grown wasm memory
+	 * is only backed once it is touched, and LMDB writes every page before
+	 * it reads it, so the region is left as it comes.
+	 */
+	void *p;
+	return posix_memalign(&p, 4096, size) ? NULL : p;
+#else
+	void *p = mmap(NULL, size, PROT_READ|PROT_WRITE,
+		MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	return p == MAP_FAILED ? NULL : p;
+#endif
+}
+
+static void ESECT
+mdb_memory_free(void *map, size_t size)
+{
+#ifdef _WIN32
+	VirtualFree(map, 0, MEM_RELEASE);
+#elif defined(__EMSCRIPTEN__)
+	free(map);
+#else
+	munmap(map, size);
+#endif
+}
+
 static int ESECT
 mdb_env_unmap(MDB_env *env)
 {
 	if (!(env->me_flags & MDB_MEMORY))
 		return munmap(env->me_map, env->me_mapsize);
-#ifdef _WIN32
-	return VirtualFree(env->me_map, 0, MEM_RELEASE) ? 0 : -1;
-#else
-	return munmap(env->me_map, env->me_mapsize);
-#endif
+	mdb_memory_free(env->me_map, env->me_mapsize);
+	return 0;
 }
 
 int ESECT
@@ -4098,19 +4128,9 @@ mdb_env_map(MDB_env *env, void *addr)
 	if (flags & MDB_MEMORY) {
 		if (addr)
 			return EINVAL;
-#ifdef _WIN32
-		env->me_map = VirtualAlloc(NULL, env->me_mapsize,
-			MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+		env->me_map = mdb_memory_alloc(env->me_mapsize);
 		if (!env->me_map)
-			return ErrCode();
-#else
-		env->me_map = mmap(NULL, env->me_mapsize, PROT_READ|PROT_WRITE,
-			MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-		if (env->me_map == MAP_FAILED) {
-			env->me_map = NULL;
-			return ErrCode();
-		}
-#endif
+			return ENOMEM;
 		goto mapped;
 	}
 #ifdef _WIN32
@@ -4219,12 +4239,36 @@ mdb_env_set_mapsize(MDB_env *env, size_t size)
 			if (size < minsize)
 				size = minsize;
 		}
-		mdb_env_unmap(env);
-		env->me_mapsize = size;
-		old = (env->me_flags & MDB_FIXEDMAP) ? env->me_map : NULL;
-		rc = mdb_env_map(env, old);
-		if (rc)
-			return rc;
+		if (env->me_flags & MDB_MEMORY) {
+			/* No file backs the map, so mapping again would start over empty.
+			 * The pages either meta can reach move to a region of the new size.
+			 */
+			void *oldmap = env->me_map;
+			size_t oldsize = env->me_mapsize;
+			pgno_t last_pg = env->me_metas[0]->mm_last_pg;
+			size_t used;
+			if (env->me_metas[1]->mm_last_pg > last_pg)
+				last_pg = env->me_metas[1]->mm_last_pg;
+			used = (last_pg + 1) * env->me_psize;
+			if (size < used)
+				size = used;
+			env->me_mapsize = size;
+			rc = mdb_env_map(env, NULL);
+			if (rc) {
+				env->me_map = oldmap;
+				env->me_mapsize = oldsize;
+				return rc;
+			}
+			memcpy(env->me_map, oldmap, used);
+			mdb_memory_free(oldmap, oldsize);
+		} else {
+			mdb_env_unmap(env);
+			env->me_mapsize = size;
+			old = (env->me_flags & MDB_FIXEDMAP) ? env->me_map : NULL;
+			rc = mdb_env_map(env, old);
+			if (rc)
+				return rc;
+		}
 	}
 	env->me_mapsize = size;
 	if (env->me_psize)
@@ -4540,6 +4584,13 @@ mdb_env_open2(MDB_env *env)
 	if (flags & MDB_MEMORY) {
 		newenv = 1;
 		env->me_psize = env->me_os_psize;
+#ifdef __EMSCRIPTEN__
+		/* Emscripten reports the 64KiB wasm page as the OS page size, which
+		 * would make every B-tree page 32KiB. An in-memory map isn't tied to
+		 * it, so use the page size LMDB gets on common native platforms.
+		 */
+		env->me_psize = 4096;
+#endif
 		if (env->me_psize > MAX_PAGESIZE)
 			env->me_psize = MAX_PAGESIZE;
 		memset(&meta, 0, sizeof(meta));
