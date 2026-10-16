@@ -4075,8 +4075,15 @@ mdb_memory_alloc(size_t size)
 	void *p;
 	return posix_memalign(&p, 4096, size) ? NULL : p;
 #else
-	void *p = mmap(NULL, size, PROT_READ|PROT_WRITE,
-		MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	/* Linux's default overcommit heuristic refuses an anonymous mapping
+	 * larger than RAM plus swap. MAP_NORESERVE leaves it out of that check,
+	 * so a large map costs address space and pages are backed on first touch.
+	 */
+	int flags = MAP_PRIVATE|MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+	flags |= MAP_NORESERVE;
+#endif
+	void *p = mmap(NULL, size, PROT_READ|PROT_WRITE, flags, -1, 0);
 	return p == MAP_FAILED ? NULL : p;
 #endif
 }
