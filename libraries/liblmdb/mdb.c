@@ -1336,6 +1336,7 @@ struct MDB_env {
 	MDB_txn		*me_txn;		/**< current write transaction */
 	MDB_txn		*me_txn0;		/**< prealloc'd write transaction */
 	size_t		me_mapsize;		/**< size of the data memory map */
+	size_t		me_memcommit;	/**< committed bytes of an #MDB_MEMORY map on Windows */
 	off_t		me_size;		/**< current file size */
 	pgno_t		me_maxpg;		/**< me_mapsize / me_psize */
 	MDB_dbx		*me_dbxs;		/**< array of static DB info */
@@ -1430,6 +1431,7 @@ static int	mdb_page_split(MDB_cursor *mc, MDB_val *newkey, MDB_val *newdata,
 				pgno_t newpgno, unsigned int nflags);
 
 static int  mdb_env_read_header(MDB_env *env, MDB_meta *meta);
+static int  mdb_memory_commit(MDB_env *env, size_t end);
 static MDB_meta *mdb_env_pick_meta(const MDB_env *env);
 static int  mdb_env_write_meta(MDB_txn *txn);
 #if defined(MDB_USE_POSIX_MUTEX) && !defined(MDB_ROBUST_SUPPORTED) /* Drop unused excl arg */
@@ -2360,6 +2362,9 @@ mdb_page_alloc(MDB_cursor *mc, int num, MDB_page **mp)
 			rc = MDB_MAP_FULL;
 			goto fail;
 	}
+	rc = mdb_memory_commit(env, (size_t)env->me_psize * (pgno + num));
+	if (rc)
+		goto fail;
 
 search_done:
 	if (env->me_flags & MDB_WRITEMAP) {
@@ -4057,7 +4062,10 @@ static void * ESECT
 mdb_memory_alloc(size_t size)
 {
 #ifdef _WIN32
-	return VirtualAlloc(NULL, size, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+	/* Only reserved. Pages are committed by mdb_memory_commit() as the map
+	 * is used, so a large map costs address space, not commit charge.
+	 */
+	return VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_READWRITE);
 #elif defined(__EMSCRIPTEN__)
 	/* Emscripten's anonymous mmap zero-fills the whole region, which puts
 	 * every page of the map in memory up front. Freshly grown wasm memory
@@ -4071,6 +4079,33 @@ mdb_memory_alloc(size_t size)
 		MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	return p == MAP_FAILED ? NULL : p;
 #endif
+}
+
+/** Make sure the first  end bytes of an #MDB_MEMORY map are backed.
+ * Linux and macOS back anonymous mappings on first touch, so only Windows,
+ * which reserves the map without committing it, has anything to do.
+ * Grows geometrically to keep the number of VirtualAlloc calls small.
+ */
+static int
+mdb_memory_commit(MDB_env *env, size_t end)
+{
+#ifdef _WIN32
+	size_t want;
+	if (!(env->me_flags & MDB_MEMORY) || end <= env->me_memcommit)
+		return MDB_SUCCESS;
+	want = env->me_memcommit * 2;
+	if (want < 1024 * 1024)
+		want = 1024 * 1024;
+	if (want < end)
+		want = end;
+	want = (want + 0xffff) & ~(size_t)0xffff;
+	if (want > env->me_mapsize)
+		want = env->me_mapsize;
+	if (!VirtualAlloc(env->me_map + env->me_memcommit, want - env->me_memcommit, MEM_COMMIT, PAGE_READWRITE))
+		return ENOMEM;
+	env->me_memcommit = want;
+#endif
+	return MDB_SUCCESS;
 }
 
 static void ESECT
@@ -4131,6 +4166,12 @@ mdb_env_map(MDB_env *env, void *addr)
 		env->me_map = mdb_memory_alloc(env->me_mapsize);
 		if (!env->me_map)
 			return ENOMEM;
+		env->me_memcommit = 0;
+		if (mdb_memory_commit(env, (size_t)env->me_psize * NUM_METAS)) {
+			mdb_memory_free(env->me_map, env->me_mapsize);
+			env->me_map = NULL;
+			return ENOMEM;
+		}
 		goto mapped;
 	}
 #ifdef _WIN32
@@ -4245,6 +4286,7 @@ mdb_env_set_mapsize(MDB_env *env, size_t size)
 			 */
 			void *oldmap = env->me_map;
 			size_t oldsize = env->me_mapsize;
+			size_t oldcommit = env->me_memcommit;
 			pgno_t last_pg = env->me_metas[0]->mm_last_pg;
 			size_t used;
 			if (env->me_metas[1]->mm_last_pg > last_pg)
@@ -4254,9 +4296,15 @@ mdb_env_set_mapsize(MDB_env *env, size_t size)
 				size = used;
 			env->me_mapsize = size;
 			rc = mdb_env_map(env, NULL);
+			if (!rc) {
+				rc = mdb_memory_commit(env, used);
+				if (rc)
+					mdb_memory_free(env->me_map, env->me_mapsize);
+			}
 			if (rc) {
 				env->me_map = oldmap;
 				env->me_mapsize = oldsize;
+				env->me_memcommit = oldcommit;
 				return rc;
 			}
 			memcpy(env->me_map, oldmap, used);
